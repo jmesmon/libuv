@@ -105,7 +105,6 @@ static int new_inotify_fd(void) {
 static void uv__inotify_read(EV_P_ ev_io* w, int revents) {
   struct inotify_event* e;
   uv_fs_event_t* handle;
-  const char* filename;
   ssize_t size;
   int events;
   char *p;
@@ -137,13 +136,7 @@ static void uv__inotify_read(EV_P_ ev_io* w, int revents) {
       if (e->mask & ~(IN_ATTRIB|IN_MODIFY))
         events |= UV_RENAME;
 
-      /* inotify does not return the filename when monitoring a single file
-       * for modifications. Repurpose the filename for API compatibility.
-       * I'm not convinced this is a good thing, maybe it should go.
-       */
-      filename = e->len ? e->name : basename_r(handle->filename);
-
-      handle->cb(handle, filename, events, 0);
+      handle->cb(handle, e->name, events, 0);
     }
   }
   while (handle->fd != -1); /* handle might've been closed by callback */
