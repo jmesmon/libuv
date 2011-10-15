@@ -35,14 +35,6 @@
 #undef NANOSEC
 #define NANOSEC 1000000000
 
-
-/* Don't look aghast, this is exactly how glibc's basename() works. */
-static char* basename_r(const char* path) {
-  char* s = strrchr(path, '/');
-  return s ? (s + 1) : (char*)path;
-}
-
-
 /*
  * There's probably some way to get time from Linux than gettimeofday(). What
  * it is, I don't know.
