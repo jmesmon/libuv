@@ -30,9 +30,6 @@
 #include "internal.h"
 
 
-const uv_err_t uv_ok_ = { UV_OK, ERROR_SUCCESS };
-
-
 /*
  * Display an error message and abort the event loop.
  */
@@ -70,7 +67,7 @@ void uv_fatal_error(const int errorno, const char* syscall) {
 /* TODO: thread safety */
 static char* last_err_str_ = NULL;
 
-char* uv_strerror(uv_err_t err) {
+const char* uv_strerror(uv_err_t err) {
   if (last_err_str_ != NULL) {
     LocalFree(last_err_str_);
   }
@@ -129,6 +126,7 @@ uv_err_code uv_translate_sys_error(int sys_errno) {
     case ERROR_PIPE_BUSY:                   return UV_EBUSY;
     case ERROR_SEM_TIMEOUT:                 return UV_ETIMEDOUT;
     case ERROR_ALREADY_EXISTS:              return UV_EEXIST;
+    case WSAHOST_NOT_FOUND:                 return UV_ENOENT;
     default:                                return UV_UNKNOWN;
   }
 }

@@ -55,6 +55,11 @@ static uv_write_t conn_notify_req;
 static int close_cb_called;
 static int connection_accepted;
 
+static uv_pipe_t stdin_pipe;
+static uv_pipe_t stdout_pipe;
+static int on_pipe_read_called;
+static int after_write_called;
+
 
 static void close_cb(uv_handle_t* handle) {
   close_cb_called++;
@@ -107,7 +112,7 @@ static void ipc_on_connection(uv_stream_t* server, int status) {
 }
 
 
-static int ipc_helper() {
+static int ipc_helper(int listen_after_write) {
   /*
    * This is launched from test-ipc.c. stdin is a duplex channel that we
    * over which a handle will be transmitted. In this initial version only
@@ -130,13 +135,20 @@ static int ipc_helper() {
   r = uv_tcp_bind(&tcp_server, uv_ip4_addr("0.0.0.0", TEST_PORT));
   ASSERT(r == 0);
 
-  r = uv_listen((uv_stream_t*)&tcp_server, 12, ipc_on_connection);
-  ASSERT(r == 0);
+  if (!listen_after_write) {
+    r = uv_listen((uv_stream_t*)&tcp_server, 12, ipc_on_connection);
+    ASSERT(r == 0);
+  }
 
   buf = uv_buf_init("hello\n", 6);
   r = uv_write2(&write_req, (uv_stream_t*)&channel, &buf, 1,
       (uv_stream_t*)&tcp_server, NULL);
   ASSERT(r == 0);
+
+  if (listen_after_write) {
+    r = uv_listen((uv_stream_t*)&tcp_server, 12, ipc_on_connection);
+    ASSERT(r == 0);
+  }
 
   r = uv_run(uv_default_loop());
   ASSERT(r == 0);
@@ -148,14 +160,114 @@ static int ipc_helper() {
 }
 
 
+void on_pipe_read(uv_stream_t* tcp, ssize_t nread, uv_buf_t buf) {
+  ASSERT(nread > 0);
+  ASSERT(memcmp("hello world\n", buf.base, nread) == 0);
+  on_pipe_read_called++;
+
+  free(buf.base);
+
+  uv_close((uv_handle_t*)&stdin_pipe, close_cb);
+  uv_close((uv_handle_t*)&stdout_pipe, close_cb);
+}
+
+
+static uv_buf_t on_pipe_read_alloc(uv_handle_t* handle,
+    size_t suggested_size) {
+  uv_buf_t buf;
+  buf.base = (char*)malloc(suggested_size);
+  buf.len = suggested_size;
+  return buf;
+}
+
+
+static void after_pipe_write(uv_write_t* req, int status) {
+  ASSERT(status == 0);
+  after_write_called++;
+}
+
+
+static int stdio_over_pipes_helper() {
+  /* Write several buffers to test that the write order is preserved. */
+  char* buffers[] = {
+    "he",
+    "ll",
+    "o ",
+    "wo",
+    "rl",
+    "d",
+    "\n"
+  };
+
+  uv_write_t write_req[COUNTOF(buffers)];
+  uv_buf_t buf[COUNTOF(buffers)];
+  int r, i;
+  uv_loop_t* loop = uv_default_loop();
+  
+  ASSERT(UV_NAMED_PIPE == uv_guess_handle(0));
+  ASSERT(UV_NAMED_PIPE == uv_guess_handle(1));
+
+  r = uv_pipe_init(loop, &stdin_pipe, 0);
+  ASSERT(r == 0);
+  r = uv_pipe_init(loop, &stdout_pipe, 0);
+  ASSERT(r == 0);
+
+  uv_pipe_open(&stdin_pipe, 0);
+  uv_pipe_open(&stdout_pipe, 1);
+
+  /* Unref both stdio handles to make sure that all writes complete. */
+  uv_unref(loop);
+  uv_unref(loop);
+
+  for (i = 0; i < COUNTOF(buffers); i++) {
+    buf[i] = uv_buf_init((char*)buffers[i], strlen(buffers[i]));
+  }
+
+  for (i = 0; i < COUNTOF(buffers); i++) {
+    r = uv_write(&write_req[i], (uv_stream_t*)&stdout_pipe, &buf[i], 1,
+      after_pipe_write);
+    ASSERT(r == 0);
+  }
+
+  uv_run(loop);
+
+  ASSERT(after_write_called == 7);
+  ASSERT(on_pipe_read_called == 0);
+  ASSERT(close_cb_called == 0);
+
+  uv_ref(loop);
+  uv_ref(loop);
+
+  r = uv_read_start((uv_stream_t*)&stdin_pipe, on_pipe_read_alloc,
+    on_pipe_read);
+  ASSERT(r == 0);
+
+  uv_run(loop);
+
+  ASSERT(after_write_called == 7);
+  ASSERT(on_pipe_read_called == 1);
+  ASSERT(close_cb_called == 2);
+
+  return 0;
+}
+
+
 static int maybe_run_test(int argc, char **argv) {
   if (strcmp(argv[1], "--list") == 0) {
     print_tests(stdout);
     return 0;
   }
 
-  if (strcmp(argv[1], "ipc_helper") == 0) {
-    return ipc_helper();
+  if (strcmp(argv[1], "ipc_helper_listen_before_write") == 0) {
+    return ipc_helper(0);
+  }
+
+  if (strcmp(argv[1], "ipc_helper_listen_after_write") == 0) {
+    return ipc_helper(1);
+  }
+
+  if (strcmp(argv[1], "stdio_over_pipes_helper") == 0) {
+    return stdio_over_pipes_helper();
   }
 
   if (strcmp(argv[1], "spawn_helper1") == 0) {

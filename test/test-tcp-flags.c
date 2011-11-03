@@ -22,15 +22,30 @@
 #include "uv.h"
 #include "task.h"
 
-TEST_IMPL(get_memory) {
-  uint64_t free_mem = uv_get_free_memory();
-  uint64_t total_mem = uv_get_total_memory();
+#include <stdio.h>
+#include <stdlib.h>
 
-  printf("free_mem=%llu, total_mem=%llu\n", free_mem, total_mem);
 
-  ASSERT(free_mem > 0);
-  ASSERT(total_mem > 0);
-  ASSERT(total_mem > free_mem);
+TEST_IMPL(tcp_flags) {
+  uv_loop_t* loop;
+  uv_tcp_t handle;
+  int r;
+
+  loop = uv_default_loop();
+
+  r = uv_tcp_init(loop, &handle);
+  ASSERT(r == 0);
+
+  r = uv_tcp_nodelay(&handle, 1);
+  ASSERT(r == 0);
+
+  r = uv_tcp_keepalive(&handle, 1, 60);
+  ASSERT(r == 0);
+
+  uv_close((uv_handle_t*)&handle, NULL);
+
+  r = uv_run(loop);
+  ASSERT(r == 0);
 
   return 0;
 }

@@ -20,17 +20,44 @@
  */
 
 #include "uv.h"
-#include "task.h"
+#include "internal.h"
 
-TEST_IMPL(get_memory) {
-  uint64_t free_mem = uv_get_free_memory();
-  uint64_t total_mem = uv_get_total_memory();
 
-  printf("free_mem=%llu, total_mem=%llu\n", free_mem, total_mem);
+uv_err_t uv_dlopen(const char* filename, uv_lib_t* library) {
+  wchar_t filename_w[32768];
+  HMODULE handle;
 
-  ASSERT(free_mem > 0);
-  ASSERT(total_mem > 0);
-  ASSERT(total_mem > free_mem);
+  if (!uv_utf8_to_utf16(filename,
+                        filename_w,
+                        sizeof(filename_w) / sizeof(wchar_t))) {
+    return uv__new_sys_error(GetLastError());
+  }
 
-  return 0;
+  handle = LoadLibraryW(filename_w);
+  if (handle == NULL) {
+    return uv__new_sys_error(GetLastError());
+  }
+
+  *library = handle;
+  return uv_ok_;
+}
+
+
+uv_err_t uv_dlclose(uv_lib_t library) {
+  if (!FreeLibrary(library)) {
+    return uv__new_sys_error(GetLastError());
+  }
+
+  return uv_ok_;
+}
+
+
+uv_err_t uv_dlsym(uv_lib_t library, const char* name, void** ptr) {
+  FARPROC proc = GetProcAddress(library, name);
+  if (proc == NULL) {
+    return uv__new_sys_error(GetLastError());
+  }
+
+  *ptr = (void*) proc;
+  return uv_ok_;
 }

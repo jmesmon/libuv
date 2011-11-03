@@ -20,17 +20,38 @@
  */
 
 #include "uv.h"
-#include "task.h"
+#include "internal.h"
 
-TEST_IMPL(get_memory) {
-  uint64_t free_mem = uv_get_free_memory();
-  uint64_t total_mem = uv_get_total_memory();
+#include <dlfcn.h>
+#include <errno.h>
 
-  printf("free_mem=%llu, total_mem=%llu\n", free_mem, total_mem);
 
-  ASSERT(free_mem > 0);
-  ASSERT(total_mem > 0);
-  ASSERT(total_mem > free_mem);
+uv_err_t uv_dlopen(const char* filename, uv_lib_t* library) {
+  void* handle = dlopen(filename, RTLD_LAZY);
+  if (handle == NULL) {
+    return uv__new_sys_error(errno);
+  }
 
-  return 0;
+  *library = handle;
+  return uv_ok_;
+}
+
+
+uv_err_t uv_dlclose(uv_lib_t library) {
+  if (dlclose(library) != 0) {
+    return uv__new_sys_error(errno);
+  }
+
+  return uv_ok_;
+}
+
+
+uv_err_t uv_dlsym(uv_lib_t library, const char* name, void** ptr) {
+  void* address = dlsym(library, name);
+  if (address == NULL) {
+    return uv__new_sys_error(errno);
+  }
+
+  *ptr = (void*) address;
+  return uv_ok_;
 }
