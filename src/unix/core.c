@@ -63,14 +63,7 @@ void uv__next(EV_P_ ev_idle* watcher, int revents);
 static void uv__finish_close(uv_handle_t* handle);
 
 
-
-#ifndef __GNUC__
-#define __attribute__(a)
-#endif
-
-
 void uv_close(uv_handle_t* handle, uv_close_cb close_cb) {
-  uv_udp_t* udp;
   uv_async_t* async;
   uv_timer_t* timer;
   uv_stream_t* stream;
@@ -103,11 +96,7 @@ void uv_close(uv_handle_t* handle, uv_close_cb close_cb) {
       break;
 
     case UV_UDP:
-      udp = (uv_udp_t*)handle;
-      uv__udp_watcher_stop(udp, &udp->read_watcher);
-      uv__udp_watcher_stop(udp, &udp->write_watcher);
-      uv__close(udp->fd);
-      udp->fd = -1;
+      uv__udp_start_close((uv_udp_t*)handle);
       break;
 
     case UV_PREPARE:
@@ -158,10 +147,31 @@ void uv_close(uv_handle_t* handle, uv_close_cb close_cb) {
 }
 
 
-uv_loop_t* uv_loop_new() {
-  uv_loop_t* loop = calloc(1, sizeof(uv_loop_t));
-  loop->ev = ev_loop_new(0);
+static int uv__loop_init(uv_loop_t* loop,
+                         struct ev_loop *(ev_loop_new)(unsigned int flags)) {
+  memset(loop, 0, sizeof(*loop));
+#if HAVE_KQUEUE
+  loop->ev = ev_loop_new(EVBACKEND_KQUEUE);
+#else
+  loop->ev = ev_loop_new(EVFLAG_AUTO);
+#endif
   ev_set_userdata(loop->ev, loop);
+  eio_channel_init(&loop->uv_eio_channel, loop);
+  return 0;
+}
+
+
+uv_loop_t* uv_loop_new(void) {
+  uv_loop_t* loop;
+
+  if ((loop = malloc(sizeof(*loop))) == NULL)
+    return NULL;
+
+  if (uv__loop_init(loop, ev_loop_new)) {
+    free(loop);
+    return NULL;
+  }
+
   return loop;
 }
 
@@ -169,27 +179,43 @@ uv_loop_t* uv_loop_new() {
 void uv_loop_delete(uv_loop_t* loop) {
   uv_ares_destroy(loop, loop->channel);
   ev_loop_destroy(loop->ev);
-  free(loop);
+
+#ifndef NDEBUG
+  memset(loop, 0, sizeof *loop);
+#endif
+
+  if (loop == default_loop_ptr)
+    default_loop_ptr = NULL;
+  else
+    free(loop);
 }
 
 
-uv_loop_t* uv_default_loop() {
-  if (!default_loop_ptr) {
-    default_loop_ptr = &default_loop_struct;
-#if HAVE_KQUEUE
-    default_loop_struct.ev = ev_default_loop(EVBACKEND_KQUEUE);
-#else
-    default_loop_struct.ev = ev_default_loop(EVFLAG_AUTO);
-#endif
-    ev_set_userdata(default_loop_struct.ev, default_loop_ptr);
-  }
-  assert(default_loop_ptr->ev == EV_DEFAULT_UC);
+int uv_loop_refcount(const uv_loop_t* loop) {
+  return ev_loop_refcount(loop->ev);
+}
+
+
+uv_loop_t* uv_default_loop(void) {
+  if (default_loop_ptr)
+    return default_loop_ptr;
+
+  if (uv__loop_init(&default_loop_struct, ev_default_loop))
+    return NULL;
+
+  default_loop_ptr = &default_loop_struct;
   return default_loop_ptr;
 }
 
 
 int uv_run(uv_loop_t* loop) {
   ev_run(loop->ev, 0);
+  return 0;
+}
+
+
+int uv_run_once(uv_loop_t* loop) {
+  ev_run(loop->ev, EVRUN_ONCE);
   return 0;
 }
 
@@ -203,7 +229,6 @@ void uv__handle_init(uv_loop_t* loop, uv_handle_t* handle,
   handle->flags = 0;
 
   ev_init(&handle->next_watcher, uv__next);
-  handle->next_watcher.data = handle;
 
   /* Ref the loop until this handle is closed. See uv__finish_close. */
   ev_ref(loop->ev);
@@ -248,10 +273,7 @@ void uv__finish_close(uv_handle_t* handle) {
       break;
 
     case UV_UDP:
-      assert(!ev_is_active(&((uv_udp_t*)handle)->read_watcher));
-      assert(!ev_is_active(&((uv_udp_t*)handle)->write_watcher));
-      assert(((uv_udp_t*)handle)->fd == -1);
-      uv__udp_destroy((uv_udp_t*)handle);
+      uv__udp_finish_close((uv_udp_t*)handle);
       break;
 
     case UV_PROCESS:
@@ -276,9 +298,9 @@ void uv__finish_close(uv_handle_t* handle) {
 }
 
 
-void uv__next(EV_P_ ev_idle* watcher, int revents) {
-  uv_handle_t* handle = watcher->data;
-  assert(watcher == &handle->next_watcher);
+void uv__next(EV_P_ ev_idle* w, int revents) {
+  uv_handle_t* handle = container_of(w, uv_handle_t, next_watcher);
+
   assert(revents == EV_IDLE);
 
   /* For now this function is only to handle the closing event, but we might
@@ -309,14 +331,14 @@ int64_t uv_now(uv_loop_t* loop) {
 }
 
 
-void uv__req_init(uv_req_t* req) {
-  /* loop->counters.req_init++; */
+void uv__req_init(uv_loop_t* loop, uv_req_t* req) {
+  loop->counters.req_init++;
   req->type = UV_UNKNOWN_REQ;
 }
 
 
 static void uv__prepare(EV_P_ ev_prepare* w, int revents) {
-  uv_prepare_t* prepare = w->data;
+  uv_prepare_t* prepare = container_of(w, uv_prepare_t, prepare_watcher);
 
   if (prepare->prepare_cb) {
     prepare->prepare_cb(prepare, 0);
@@ -329,8 +351,6 @@ int uv_prepare_init(uv_loop_t* loop, uv_prepare_t* prepare) {
   loop->counters.prepare_init++;
 
   ev_prepare_init(&prepare->prepare_watcher, uv__prepare);
-  prepare->prepare_watcher.data = prepare;
-
   prepare->prepare_cb = NULL;
 
   return 0;
@@ -366,7 +386,7 @@ int uv_prepare_stop(uv_prepare_t* prepare) {
 
 
 static void uv__check(EV_P_ ev_check* w, int revents) {
-  uv_check_t* check = w->data;
+  uv_check_t* check = container_of(w, uv_check_t, check_watcher);
 
   if (check->check_cb) {
     check->check_cb(check, 0);
@@ -379,8 +399,6 @@ int uv_check_init(uv_loop_t* loop, uv_check_t* check) {
   loop->counters.check_init++;
 
   ev_check_init(&check->check_watcher, uv__check);
-  check->check_watcher.data = check;
-
   check->check_cb = NULL;
 
   return 0;
@@ -416,7 +434,7 @@ int uv_check_stop(uv_check_t* check) {
 
 
 static void uv__idle(EV_P_ ev_idle* w, int revents) {
-  uv_idle_t* idle = (uv_idle_t*)(w->data);
+  uv_idle_t* idle = container_of(w, uv_idle_t, idle_watcher);
 
   if (idle->idle_cb) {
     idle->idle_cb(idle, 0);
@@ -430,8 +448,6 @@ int uv_idle_init(uv_loop_t* loop, uv_idle_t* idle) {
   loop->counters.idle_init++;
 
   ev_idle_init(&idle->idle_watcher, uv__idle);
-  idle->idle_watcher.data = idle;
-
   idle->idle_cb = NULL;
 
   return 0;
@@ -486,7 +502,7 @@ int uv_is_active(uv_handle_t* handle) {
 
 
 static void uv__async(EV_P_ ev_async* w, int revents) {
-  uv_async_t* async = w->data;
+  uv_async_t* async = container_of(w, uv_async_t, async_watcher);
 
   if (async->async_cb) {
     async->async_cb(async, 0);
@@ -499,8 +515,6 @@ int uv_async_init(uv_loop_t* loop, uv_async_t* async, uv_async_cb async_cb) {
   loop->counters.async_init++;
 
   ev_async_init(&async->async_watcher, uv__async);
-  async->async_watcher.data = async;
-
   async->async_cb = async_cb;
 
   /* Note: This does not have symmetry with the other libev wrappers. */
@@ -518,7 +532,7 @@ int uv_async_send(uv_async_t* async) {
 
 
 static void uv__timer_cb(EV_P_ ev_timer* w, int revents) {
-  uv_timer_t* timer = w->data;
+  uv_timer_t* timer = container_of(w, uv_timer_t, timer_watcher);
 
   if (!ev_is_active(w)) {
     ev_ref(EV_A);
@@ -535,7 +549,6 @@ int uv_timer_init(uv_loop_t* loop, uv_timer_t* timer) {
   loop->counters.timer_init++;
 
   ev_init(&timer->timer_watcher, uv__timer_cb);
-  timer->timer_watcher.data = timer;
 
   return 0;
 }
@@ -589,6 +602,10 @@ int64_t uv_timer_get_repeat(uv_timer_t* timer) {
 static int uv_getaddrinfo_done(eio_req* req) {
   uv_getaddrinfo_t* handle = req->data;
   struct addrinfo *res = handle->res;
+#if __sun
+  size_t hostlen = strlen(handle->hostname);
+#endif
+
   handle->res = NULL;
 
   uv_unref(handle->loop);
@@ -605,6 +622,10 @@ static int uv_getaddrinfo_done(eio_req* req) {
   } else if (handle->retcode == EAI_NONAME) {
 #endif
     uv__set_sys_error(handle->loop, ENOENT); /* FIXME compatibility hack */
+#if __sun
+  } else if (handle->retcode == EAI_MEMORY && hostlen >= MAXHOSTNAMELEN) {
+    uv__set_sys_error(handle->loop, ENOENT);
+#endif
   } else {
     handle->loop->last_err.code = UV_EADDRINFO;
     handle->loop->last_err.sys_errno_ = handle->retcode;
@@ -642,7 +663,7 @@ int uv_getaddrinfo(uv_loop_t* loop,
     return -1;
   }
 
-  uv__req_init((uv_req_t*)handle);
+  uv__req_init(loop, (uv_req_t*)handle);
   handle->type = UV_GETADDRINFO;
   handle->loop = loop;
   handle->cb = cb;
@@ -670,7 +691,7 @@ int uv_getaddrinfo(uv_loop_t* loop,
   uv_ref(loop);
 
   req = eio_custom(getaddrinfo_thread_proc, EIO_PRI_DEFAULT,
-      uv_getaddrinfo_done, handle);
+      uv_getaddrinfo_done, handle, &loop->uv_eio_channel);
   assert(req);
   assert(req->data == handle);
 
@@ -686,22 +707,30 @@ void uv_freeaddrinfo(struct addrinfo* ai) {
 
 /* Open a socket in non-blocking close-on-exec mode, atomically if possible. */
 int uv__socket(int domain, int type, int protocol) {
-#if defined(SOCK_NONBLOCK) && defined(SOCK_CLOEXEC)
-  return socket(domain, type | SOCK_NONBLOCK | SOCK_CLOEXEC, protocol);
-#else
   int sockfd;
 
-  if ((sockfd = socket(domain, type, protocol)) == -1) {
-    return -1;
-  }
+#if defined(SOCK_NONBLOCK) && defined(SOCK_CLOEXEC)
+  sockfd = socket(domain, type | SOCK_NONBLOCK | SOCK_CLOEXEC, protocol);
 
-  if (uv__nonblock(sockfd, 1) == -1 || uv__cloexec(sockfd, 1) == -1) {
-    uv__close(sockfd);
-    return -1;
-  }
+  if (sockfd != -1)
+    goto out;
 
-  return sockfd;
+  if (errno != EINVAL)
+    goto out;
 #endif
+
+  sockfd = socket(domain, type, protocol);
+
+  if (sockfd == -1)
+    goto out;
+
+  if (uv__nonblock(sockfd, 1) || uv__cloexec(sockfd, 1)) {
+    uv__close(sockfd);
+    sockfd = -1;
+  }
+
+out:
+  return sockfd;
 }
 
 
@@ -710,38 +739,36 @@ int uv__accept(int sockfd, struct sockaddr* saddr, socklen_t slen) {
 
   assert(sockfd >= 0);
 
-  do {
-#if defined(HAVE_ACCEPT4)
-    peerfd = accept4(sockfd, saddr, &slen, SOCK_NONBLOCK | SOCK_CLOEXEC);
-#else
-    if ((peerfd = accept(sockfd, saddr, &slen)) != -1) {
-      if (uv__cloexec(peerfd, 1) == -1 || uv__nonblock(peerfd, 1) == -1) {
-        uv__close(peerfd);
-        return -1;
-      }
-    }
+  while (1) {
+#if HAVE_SYS_ACCEPT4
+    peerfd = sys_accept4(sockfd, saddr, &slen, SOCK_NONBLOCK | SOCK_CLOEXEC);
+
+    if (peerfd != -1)
+      break;
+
+    if (errno == EINTR)
+      continue;
+
+    if (errno != ENOSYS)
+      break;
 #endif
+
+    if ((peerfd = accept(sockfd, saddr, &slen)) == -1) {
+      if (errno == EINTR)
+        continue;
+      else
+        break;
+    }
+
+    if (uv__cloexec(peerfd, 1) || uv__nonblock(peerfd, 1)) {
+      uv__close(peerfd);
+      peerfd = -1;
+    }
+
+    break;
   }
-  while (peerfd == -1 && errno == EINTR);
 
   return peerfd;
-}
-
-
-int uv__close(int fd) {
-  int status;
-
-  /*
-   * Retry on EINTR. You may think this is academic but on linux
-   * and probably other Unices too, close(2) is interruptible.
-   * Failing to handle EINTR is a common source of fd leaks.
-   */
-  do {
-    status = close(fd);
-  }
-  while (status == -1 && errno == EINTR);
-
-  return status;
 }
 
 
@@ -798,6 +825,24 @@ int uv__cloexec(int fd, int set) {
 }
 
 
+/* This function is not execve-safe, there is a race window
+ * between the call to dup() and fcntl(FD_CLOEXEC).
+ */
+int uv__dup(int fd) {
+  fd = dup(fd);
+
+  if (fd == -1)
+    return -1;
+
+  if (uv__cloexec(fd, 1)) {
+    SAVE_ERRNO(uv__close(fd));
+    return -1;
+  }
+
+  return fd;
+}
+
+
 /* TODO move to uv-common.c? */
 size_t uv__strlcpy(char* dst, const char* src, size_t size) {
   const char *org;
@@ -813,4 +858,26 @@ size_t uv__strlcpy(char* dst, const char* src, size_t size) {
   *dst = '\0';
 
   return src - org;
+}
+
+
+uv_err_t uv_cwd(char* buffer, size_t size) {
+  if (!buffer || !size) {
+    return uv__new_artificial_error(UV_EINVAL);
+  }
+
+  if (getcwd(buffer, size)) {
+    return uv_ok_;
+  } else {
+    return uv__new_sys_error(errno);
+  }
+}
+
+
+uv_err_t uv_chdir(const char* dir) {
+  if (chdir(dir) == 0) {
+    return uv_ok_;
+  } else {
+    return uv__new_sys_error(errno);
+  }
 }

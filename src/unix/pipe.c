@@ -74,7 +74,7 @@ int uv_pipe_bind(uv_pipe_t* handle, const char* name) {
   }
 
   memset(&saddr, 0, sizeof saddr);
-  uv__strlcpy(saddr.sun_path, pipe_fname, sizeof(saddr.sun_path));
+  uv_strlcpy(saddr.sun_path, pipe_fname, sizeof(saddr.sun_path));
   saddr.sun_family = AF_UNIX;
 
   if (bind(sockfd, (struct sockaddr*)&saddr, sizeof saddr) == -1) {
@@ -177,7 +177,7 @@ void uv_pipe_open(uv_pipe_t* handle, uv_file fd) {
 }
 
 
-int uv_pipe_connect(uv_connect_t* req,
+void uv_pipe_connect(uv_connect_t* req,
                     uv_pipe_t* handle,
                     const char* name,
                     uv_connect_cb cb) {
@@ -197,7 +197,7 @@ int uv_pipe_connect(uv_connect_t* req,
   }
 
   memset(&saddr, 0, sizeof saddr);
-  uv__strlcpy(saddr.sun_path, name, sizeof(saddr.sun_path));
+  uv_strlcpy(saddr.sun_path, name, sizeof(saddr.sun_path));
   saddr.sun_family = AF_UNIX;
 
   /* We don't check for EINPROGRESS. Think about it: the socket
@@ -209,7 +209,7 @@ int uv_pipe_connect(uv_connect_t* req,
   while (r == -1 && errno == EINTR);
 
   if (r == -1) {
-    uv__set_sys_error(handle->loop, errno);
+    status = errno;
     uv__close(sockfd);
     goto out;
   }
@@ -237,7 +237,6 @@ out:
    * return 0 and let the callback handle errors.
    */
   errno = saved_errno;
-  return 0;
 }
 
 
@@ -252,7 +251,6 @@ void uv__pipe_accept(EV_P_ ev_io* watcher, int revents) {
   pipe = watcher->data;
 
   assert(pipe->type == UV_NAMED_PIPE);
-  assert(pipe->pipe_fname != NULL);
 
   sockfd = uv__accept(pipe->fd, (struct sockaddr *)&saddr, sizeof saddr);
   if (sockfd == -1) {
@@ -271,4 +269,8 @@ void uv__pipe_accept(EV_P_ ev_io* watcher, int revents) {
   }
 
   errno = saved_errno;
+}
+
+
+void uv_pipe_pending_instances(uv_pipe_t* handle, int count) {
 }

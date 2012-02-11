@@ -31,6 +31,7 @@
 #include <sys/sysctl.h>
 #include <sys/types.h>
 #include <sys/event.h>
+#include <unistd.h>
 #include <fcntl.h>
 #include <time.h>
 
@@ -43,10 +44,12 @@ static void uv__fs_event_start(uv_fs_event_t* handle) {
              handle->fd,
              EV_LIBUV_KQUEUE_HACK);
   ev_io_start(handle->loop->ev, &handle->event_watcher);
+  ev_unref(handle->loop->ev);
 }
 
 
 static void uv__fs_event_stop(uv_fs_event_t* handle) {
+  ev_ref(handle->loop->ev);
   ev_io_stop(handle->loop->ev, &handle->event_watcher);
 }
 
@@ -86,8 +89,14 @@ void uv__kqueue_hack(EV_P_ int fflags, ev_io *w) {
 int uv_fs_event_init(uv_loop_t* loop,
                      uv_fs_event_t* handle,
                      const char* filename,
-                     uv_fs_event_cb cb) {
+                     uv_fs_event_cb cb,
+                     int flags) {
   int fd;
+
+  loop->counters.fs_event_init++;
+
+  /* We don't support any flags yet. */
+  assert(!flags);
 
   if (cb == NULL) {
     uv__set_sys_error(loop, EINVAL);
@@ -112,6 +121,7 @@ int uv_fs_event_init(uv_loop_t* loop,
 
 
 void uv__fs_event_destroy(uv_fs_event_t* handle) {
+  uv__fs_event_stop(handle);
   free(handle->filename);
   uv__close(handle->fd);
   handle->fd = -1;
@@ -122,20 +132,22 @@ void uv__fs_event_destroy(uv_fs_event_t* handle) {
 int uv_fs_event_init(uv_loop_t* loop,
                      uv_fs_event_t* handle,
                      const char* filename,
-                     uv_fs_event_cb cb) {
+                     uv_fs_event_cb cb,
+                     int flags) {
+  loop->counters.fs_event_init++;
   uv__set_sys_error(loop, ENOSYS);
   return -1;
 }
 
 
 void uv__fs_event_destroy(uv_fs_event_t* handle) {
-  assert(0 && "unreachable");
+  UNREACHABLE();
 }
 
 
 /* Called by libev, don't touch. */
 void uv__kqueue_hack(EV_P_ int fflags, ev_io *w) {
-  assert(0 && "unreachable");
+  UNREACHABLE();
 }
 
 #endif /* HAVE_KQUEUE */

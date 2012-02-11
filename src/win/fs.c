@@ -173,17 +173,22 @@ void fs__open(uv_fs_t* req, const wchar_t* path, int flags, int mode) {
   /* convert flags and mode to CreateFile parameters */
   switch (flags & (_O_RDONLY | _O_WRONLY | _O_RDWR)) {
   case _O_RDONLY:
-    access = GENERIC_READ;
+    access = FILE_GENERIC_READ;
     break;
   case _O_WRONLY:
-    access = GENERIC_WRITE;
+    access = FILE_GENERIC_WRITE;
     break;
   case _O_RDWR:
-    access = GENERIC_READ | GENERIC_WRITE;
+    access = FILE_GENERIC_READ | FILE_GENERIC_WRITE;
     break;
   default:
     result  = -1;
     goto end;
+  }
+
+  if (flags & _O_APPEND) {
+    access &= ~FILE_WRITE_DATA;
+    access |= FILE_APPEND_DATA;
   }
 
   /*
@@ -383,7 +388,7 @@ void fs__readdir(uv_fs_t* req, const wchar_t* path, int flags) {
   HANDLE dir;
   WIN32_FIND_DATAW ent = {0};
   size_t len = wcslen(path);
-  size_t buf_size = 4096;
+  size_t buf_char_len = 4096;
   wchar_t* path2;
   const wchar_t* fmt = !len                                         ? L"./*"
                 : (path[len - 1] == L'/' || path[len - 1] == L'\\') ? L"%s*"
@@ -424,7 +429,7 @@ void fs__readdir(uv_fs_t* req, const wchar_t* path, int flags) {
       len = wcslen(name);
 
       if (!buf) {
-        buf = (wchar_t*)malloc(buf_size * sizeof(wchar_t));
+        buf = (wchar_t*)malloc(buf_char_len * sizeof(wchar_t));
         if (!buf) {
           uv_fatal_error(ERROR_OUTOFMEMORY, "malloc");
         }
@@ -432,10 +437,10 @@ void fs__readdir(uv_fs_t* req, const wchar_t* path, int flags) {
         ptr = buf;
       }
 
-      while ((ptr - buf) + len + 1 > buf_size) {
-        buf_size *= 2;
+      while ((ptr - buf) + len + 1 > buf_char_len) {
+        buf_char_len *= 2;
         path2 = buf;
-        buf = (wchar_t*)realloc(buf, buf_size * sizeof(wchar_t));
+        buf = (wchar_t*)realloc(buf, buf_char_len * sizeof(wchar_t));
         if (!buf) {
           uv_fatal_error(ERROR_OUTOFMEMORY, "realloc");
         }
@@ -453,7 +458,7 @@ void fs__readdir(uv_fs_t* req, const wchar_t* path, int flags) {
 
   if (buf) {
     /* Convert result to UTF8. */
-    size = uv_utf16_to_utf8(buf, buf_size / sizeof(wchar_t), NULL, 0);
+    size = uv_utf16_to_utf8(buf, buf_char_len, NULL, 0);
     if (!size) {
       SET_REQ_RESULT_WIN32_ERROR(req, GetLastError());
       return;
@@ -464,7 +469,7 @@ void fs__readdir(uv_fs_t* req, const wchar_t* path, int flags) {
       uv_fatal_error(ERROR_OUTOFMEMORY, "malloc");
     }
 
-    size = uv_utf16_to_utf8(buf, buf_size / sizeof(wchar_t), (char*)req->ptr, size);
+    size = uv_utf16_to_utf8(buf, buf_char_len, (char*)req->ptr, size);
     if (!size) {
       free(buf);
       free(req->ptr);
@@ -484,17 +489,191 @@ void fs__readdir(uv_fs_t* req, const wchar_t* path, int flags) {
 }
 
 
-void fs__stat(uv_fs_t* req, const wchar_t* path) {
-  int result;
+#define IS_SLASH(c) \
+  ((wchar_t) c == L'/' || (wchar_t) c == L'\\')
+#define IS_COLON(c) \
+  ((wchar_t) c == L':')
+#define IS_LETTER(c) \
+  ((((wchar_t) c >= L'a') && ((wchar_t) c <= L'z')) || \
+   (((wchar_t) c >= L'A') && ((wchar_t) c <= L'Z')))
+#define IS_QUESTION(c) \
+  ((wchar_t) c == L'?')
 
-  result = _wstati64(path, &req->stat);
-  if (result == -1) {
-    req->ptr = NULL;
-  } else {
-    req->ptr = &req->stat;
+
+static int uv__count_slash_separated_words(const wchar_t* pos,
+                                           const wchar_t* end,
+                                           int limit) {
+  char last_was_slash = 1, count = 0;
+
+  for (; pos < end; pos++) {
+    if (IS_SLASH(*pos)) {
+      /* Don't accept double slashes */
+      if (last_was_slash) {
+        return 0;
+      } else {
+        last_was_slash = 1;
+      }
+    } else {
+      if (last_was_slash) {
+        /* Found a new word */
+        count++;
+        if (count > limit) {
+          return -1;
+        }
+        last_was_slash = 0;
+      }
+    }
   }
 
-  SET_REQ_RESULT(req, result);
+  return count;
+}
+
+/*
+ * Returns true if the given path is a root directory. The following patterns
+ * are recognized:
+ * \
+ * c:\ (must have trailing slash)
+ * \\server\share (trailing slash optional)
+ * \\?\c: (trailing slash optional)
+ * \\?\UNC\server\share (trailing slash optional)
+ */
+static int uv__is_root(const wchar_t* path) {
+  size_t len = wcslen(path);
+
+  /* Test for \ */
+  if (len == 1 && IS_SLASH(path[0])) {
+    return 1;
+  }
+
+  if (len < 3) {
+    return 0;
+  }
+
+  /* Test for c:\ */
+  if (IS_LETTER(path[0]) && IS_COLON(path[1]) && IS_SLASH(path[2])) {
+    return 1;
+  }
+
+  if (!IS_SLASH(path[0]) || !IS_SLASH(path[1])) {
+    return 0;
+  }
+
+  /* Test for \\server\share */
+  if (!IS_QUESTION(path[2])) {
+    return uv__count_slash_separated_words(path + 2, path + len, 2) == 2;
+  }
+
+  if (!IS_SLASH(path[3])) {
+    return 0;
+  }
+
+  if ((len == 6 || len == 7) &&
+      IS_LETTER(path[4]) && IS_COLON(path[5]) &&
+      (len == 6 || IS_SLASH(path[6]))) {
+    return 1;
+  }
+
+  /* Test for \\?\UNC\server\share */
+  if (len >= 8 &&
+      (path[4] == L'u' || path[4] == L'U') &&
+      (path[5] == L'n' || path[5] == L'N') &&
+      (path[6] == L'c' || path[6] == L'C') &&
+      IS_SLASH(path[7])) {
+    return uv__count_slash_separated_words(path + 8, path + len, 2) == 2;
+  }
+
+  return 0;
+}
+
+
+void fs__stat(uv_fs_t* req, const wchar_t* path) {
+  HANDLE file;
+  WIN32_FIND_DATAW ent;
+  int result;
+
+  req->ptr = NULL;
+
+  if (uv__is_root(path)) {
+    /* We can't stat root directories like c:\. _wstati64 can't either, but */
+    /* it will make up something reasonable. */
+    DWORD drive_type = GetDriveTypeW(path);
+    if (drive_type == DRIVE_UNKNOWN || drive_type == DRIVE_NO_ROOT_DIR) {
+      req->last_error = ERROR_PATH_NOT_FOUND;
+      req->errorno = UV_ENOENT;
+      req->result = -1;
+      return;
+    }
+
+    memset(&req->stat, 0, sizeof req->stat);
+
+    req->stat.st_nlink = 1;
+    req->stat.st_mode = ((_S_IREAD|_S_IWRITE) + ((_S_IREAD|_S_IWRITE) >> 3) +
+        ((_S_IREAD|_S_IWRITE) >> 6)) | S_IFDIR;
+
+    req->last_error = ERROR_SUCCESS;
+    req->errorno = UV_OK;
+    req->result = 0;
+    req->ptr = &req->stat;
+    return;
+  }
+
+  file = FindFirstFileExW(path, FindExInfoStandard, &ent,
+    FindExSearchNameMatch, NULL, 0);
+
+  if (file == INVALID_HANDLE_VALUE) {
+    SET_REQ_RESULT_WIN32_ERROR(req, GetLastError());
+    return;
+  }
+
+  FindClose(file);
+
+  if (ent.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT &&
+      ent.dwReserved0 == IO_REPARSE_TAG_SYMLINK) {
+    fs__open(req, path, _O_RDONLY, 0);
+    if (req->result != -1) {
+      result = _fstati64(req->result, &req->stat);
+      _close(req->result);
+
+      if (result != -1) {
+        req->ptr = &req->stat;
+      }
+
+      SET_REQ_RESULT(req, result);
+    }
+
+    return;
+  }
+
+  req->stat.st_ino = 0;
+  req->stat.st_uid = 0;
+  req->stat.st_gid = 0;
+  req->stat.st_mode = 0;
+  req->stat.st_rdev = 0;
+  req->stat.st_dev = 0;
+  req->stat.st_nlink = 1;
+
+  if (ent.dwFileAttributes & FILE_ATTRIBUTE_READONLY ) {
+    req->stat.st_mode |= (_S_IREAD + (_S_IREAD >> 3) + (_S_IREAD >> 6));
+  } else {
+    req->stat.st_mode |= ((_S_IREAD|_S_IWRITE) + ((_S_IREAD|_S_IWRITE) >> 3) +
+      ((_S_IREAD|_S_IWRITE) >> 6));
+  }
+
+  if (ent.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+    req->stat.st_mode |= _S_IFDIR;
+  } else {
+    req->stat.st_mode |= _S_IFREG;
+  }
+
+  uv_filetime_to_time_t(&ent.ftLastWriteTime, &(req->stat.st_mtime));
+  uv_filetime_to_time_t(&ent.ftLastAccessTime, &(req->stat.st_atime));
+  uv_filetime_to_time_t(&ent.ftCreationTime, &(req->stat.st_ctime));
+
+  req->stat.st_size = ((int64_t)ent.nFileSizeHigh << 32) +
+    (int64_t)ent.nFileSizeLow;
+
+  req->ptr = &req->stat;
+  req->result = 0;
 }
 
 
@@ -515,8 +694,12 @@ void fs__fstat(uv_fs_t* req, uv_file file) {
 
 
 void fs__rename(uv_fs_t* req, const wchar_t* path, const wchar_t* new_path) {
-  int result = _wrename(path, new_path);
-  SET_REQ_RESULT(req, result);
+  if (!MoveFileExW(path, new_path, MOVEFILE_REPLACE_EXISTING)) {
+    SET_REQ_RESULT_WIN32_ERROR(req, GetLastError());
+    return;
+  }
+
+  SET_REQ_RESULT(req, 0);
 }
 
 
@@ -682,7 +865,7 @@ void fs__symlink(uv_fs_t* req, const wchar_t* path, const wchar_t* new_path,
     req->last_error = ERROR_SUCCESS;
     return;
   }
-  
+
   SET_REQ_RESULT(req, result);
 }
 
@@ -721,7 +904,7 @@ void fs__readlink(uv_fs_t* req, const wchar_t* path) {
                        FSCTL_GET_REPARSE_POINT,
                        NULL,
                        0,
-                       buffer, 
+                       buffer,
                        MAXIMUM_REPARSE_DATA_BUFFER_SIZE,
                        &bytes_returned,
                        NULL);
@@ -1512,3 +1695,4 @@ void uv_fs_req_cleanup(uv_fs_t* req) {
 
   req->flags |= UV_FS_CLEANEDUP;
 }
+

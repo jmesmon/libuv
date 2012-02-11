@@ -34,6 +34,7 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <termios.h>
+#include <pthread.h>
 
 /* Note: May be cast to struct iovec. See writev(2). */
 typedef struct {
@@ -42,6 +43,13 @@ typedef struct {
 } uv_buf_t;
 
 typedef int uv_file;
+
+#define UV_ONCE_INIT PTHREAD_ONCE_INIT
+
+typedef pthread_once_t uv_once_t;
+typedef pthread_t uv_thread_t;
+typedef pthread_mutex_t uv_mutex_t;
+typedef pthread_rwlock_t uv_rwlock_t;
 
 /* Platform-specific definitions for uv_dlopen support. */
 typedef void* uv_lib_t;
@@ -55,6 +63,8 @@ typedef void* uv_lib_t;
    * definition of ares_timeout(). \
    */ \
   ev_timer timer; \
+  /* Poll result queue */ \
+  eio_channel uv_eio_channel; \
   struct ev_loop* ev;
 
 #define UV_REQ_BUFSML_SIZE (4)
@@ -182,6 +192,9 @@ typedef void* uv_lib_t;
   struct termios orig_termios; \
   int mode;
 
+#define UV_STREAM_INFO_PRIVATE_FIELDS \
+  int fd;
+
 /* UV_FS_EVENT_PRIVATE_FIELDS */
 #if defined(__linux__)
 
@@ -204,10 +217,14 @@ typedef void* uv_lib_t;
 #include <sys/port.h>
 #include <port.h>
 
-#define UV_FS_EVENT_PRIVATE_FIELDS \
+#ifdef PORT_SOURCE_FILE
+# define UV_FS_EVENT_PRIVATE_FIELDS \
   ev_io event_watcher; \
   uv_fs_event_cb cb; \
-  file_obj_t fo; \
+  file_obj_t fo;
+#else /* !PORT_SOURCE_FILE */
+# define UV_FS_EVENT_PRIVATE_FIELDS
+#endif
 
 #else
 

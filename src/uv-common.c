@@ -24,6 +24,7 @@
 
 #include <assert.h>
 #include <stddef.h> /* NULL */
+#include <stdlib.h> /* malloc */
 #include <string.h> /* memset */
 
 /* use inet_pton from c-ares if necessary */
@@ -32,11 +33,38 @@
 #include "ares/inet_ntop.h"
 
 
-static uv_counters_t counters;
+size_t uv_strlcpy(char* dst, const char* src, size_t size) {
+  size_t n;
+
+  if (size == 0)
+    return 0;
+
+  for (n = 0; n < (size - 1) && *src != '\0'; n++)
+    *dst++ = *src++;
+
+  *dst = '\0';
+
+  return n;
+}
 
 
-uv_counters_t* uv_counters() {
-  return &counters;
+size_t uv_strlcat(char* dst, const char* src, size_t size) {
+  size_t n;
+
+  if (size == 0)
+    return 0;
+
+  for (n = 0; n < size && *dst != '\0'; n++, dst++);
+
+  if (n == size)
+    return n;
+
+  while (n < (size - 1) && *src != '\0')
+    n++, *dst++ = *src++;
+
+  *dst = '\0';
+
+  return n;
 }
 
 
@@ -50,55 +78,27 @@ uv_buf_t uv_buf_init(char* base, size_t len) {
 
 const uv_err_t uv_ok_ = { UV_OK, 0 };
 
-
+#define UV_ERR_NAME_GEN(val, name, s) case UV_##name : return #name;
 const char* uv_err_name(uv_err_t err) {
   switch (err.code) {
-    case UV_UNKNOWN: return "UNKNOWN";
-    case UV_OK: return "OK";
-    case UV_EOF: return "EOF";
-    case UV_EADDRINFO: return "EADDRINFO";
-    case UV_EACCESS: return "EACCESS";
-    case UV_EAGAIN: return "EAGAIN";
-    case UV_EADDRINUSE: return "EADDRINUSE";
-    case UV_EADDRNOTAVAIL: return "EADDRNOTAVAIL";
-    case UV_EAFNOSUPPORT: return "EAFNOSUPPORT";
-    case UV_EALREADY: return "EALREADY";
-    case UV_EBADF: return "EBADF";
-    case UV_EBUSY: return "EBUSY";
-    case UV_ECONNABORTED: return "ECONNABORTED";
-    case UV_ECONNREFUSED: return "ECONNREFUSED";
-    case UV_ECONNRESET: return "ECONNRESET";
-    case UV_EDESTADDRREQ: return "EDESTADDRREQ";
-    case UV_EFAULT: return "EFAULT";
-    case UV_EHOSTUNREACH: return "EHOSTUNREACH";
-    case UV_EINTR: return "EINTR";
-    case UV_EINVAL: return "EINVAL";
-    case UV_EISCONN: return "EISCONN";
-    case UV_EMFILE: return "EMFILE";
-    case UV_ENETDOWN: return "ENETDOWN";
-    case UV_ENETUNREACH: return "ENETUNREACH";
-    case UV_ENFILE: return "ENFILE";
-    case UV_ENOBUFS: return "ENOBUFS";
-    case UV_ENOMEM: return "ENOMEM";
-    case UV_ENOTDIR: return "ENOTDIR";
-    case UV_ENONET: return "ENONET";
-    case UV_ENOPROTOOPT: return "ENOPROTOOPT";
-    case UV_ENOTCONN: return "ENOTCONN";
-    case UV_ENOTSOCK: return "ENOTSOCK";
-    case UV_ENOTSUP: return "ENOTSUP";
-    case UV_ENOENT: return "ENOENT";
-    case UV_ENOSYS: return "ENOSYS";
-    case UV_EPIPE: return "EPIPE";
-    case UV_EPROTO: return "EPROTO";
-    case UV_EPROTONOSUPPORT: return "EPROTONOSUPPORT";
-    case UV_EPROTOTYPE: return "EPROTOTYPE";
-    case UV_ETIMEDOUT: return "ETIMEDOUT";
-    case UV_EEXIST: return "EEXIST";
+    UV_ERRNO_MAP(UV_ERR_NAME_GEN)
     default:
       assert(0);
       return NULL;
   }
 }
+#undef UV_ERR_NAME_GEN
+
+
+#define UV_STRERROR_GEN(val, name, s) case UV_##name : return s;
+const char* uv_strerror(uv_err_t err) {
+  switch (err.code) {
+    UV_ERRNO_MAP(UV_STRERROR_GEN)
+    default:
+      return "Unknown system error";
+  }
+}
+#undef UV_STRERROR_GEN
 
 
 void uv__set_error(uv_loop_t* loop, uv_err_code code, int sys_error) {
@@ -114,8 +114,7 @@ void uv__set_sys_error(uv_loop_t* loop, int sys_error) {
 
 
 void uv__set_artificial_error(uv_loop_t* loop, uv_err_code code) {
-  loop->last_err.code = code;
-  loop->last_err.sys_errno_ = 0;
+  loop->last_err = uv__new_artificial_error(code);
 }
 
 
@@ -123,6 +122,14 @@ uv_err_t uv__new_sys_error(int sys_error) {
   uv_err_t error;
   error.code = uv_translate_sys_error(sys_error);
   error.sys_errno_ = sys_error;
+  return error;
+}
+
+
+uv_err_t uv__new_artificial_error(uv_err_code code) {
+  uv_err_t error;
+  error.code = code;
+  error.sys_errno_ = 0;
   return error;
 }
 
@@ -281,4 +288,54 @@ int uv_tcp_connect6(uv_connect_t* req,
   }
 
   return uv__tcp_connect6(req, handle, address, cb);
+}
+
+
+#ifdef _WIN32
+static UINT __stdcall uv__thread_start(void *ctx_v)
+#else
+static void *uv__thread_start(void *ctx_v)
+#endif
+{
+  void (*entry)(void *arg);
+  void *arg;
+
+  struct {
+    void (*entry)(void *arg);
+    void *arg;
+  } *ctx;
+
+  ctx = ctx_v;
+  arg = ctx->arg;
+  entry = ctx->entry;
+  free(ctx);
+  entry(arg);
+
+  return 0;
+}
+
+
+int uv_thread_create(uv_thread_t *tid, void (*entry)(void *arg), void *arg) {
+  struct {
+    void (*entry)(void *arg);
+    void *arg;
+  } *ctx;
+
+  if ((ctx = malloc(sizeof *ctx)) == NULL)
+    return -1;
+
+  ctx->entry = entry;
+  ctx->arg = arg;
+
+#ifdef _WIN32
+  *tid = (HANDLE) _beginthreadex(NULL, 0, uv__thread_start, ctx, 0, NULL);
+  if (*tid == 0) {
+#else
+  if (pthread_create(tid, NULL, uv__thread_start, ctx)) {
+#endif
+    free(ctx);
+    return -1;
+  }
+
+  return 0;
 }

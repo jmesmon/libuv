@@ -254,7 +254,7 @@ static wchar_t* path_search_walk_ext(const wchar_t *dir,
  * - CMD does not trim leading/trailing whitespace from path/pathex entries
  *   nor from the environment variables as a whole.
  *
- * - When cmd.exe cannot read a directory, it wil just skip it and go on
+ * - When cmd.exe cannot read a directory, it will just skip it and go on
  *   searching. However, unlike posix-y systems, it will happily try to run a
  *   file that is not readable/executable; if the spawn fails it will not
  *   continue searching.
@@ -268,6 +268,8 @@ static wchar_t* search_path(const wchar_t *file,
   wchar_t* result = NULL;
   wchar_t *file_name_start;
   wchar_t *dot;
+  const wchar_t *dir_start, *dir_end, *dir_path;
+  int dir_len;
   int name_has_ext;
 
   int file_len = wcslen(file);
@@ -305,8 +307,7 @@ static wchar_t* search_path(const wchar_t *file,
         name_has_ext);
 
   } else {
-    const wchar_t *dir_start,
-                *dir_end = path;
+    dir_end = path;
 
     /* The file is really only a name; look in cwd first, then scan path */
     result = path_search_walk_ext(L"", 0,
@@ -338,7 +339,20 @@ static wchar_t* search_path(const wchar_t *file,
         continue;
       }
 
-      result = path_search_walk_ext(dir_start, dir_end - dir_start,
+      dir_path = dir_start;
+      dir_len = dir_end - dir_start;
+
+      /* Adjust if the path is quoted. */
+      if (dir_path[0] == '"' || dir_path[0] == '\'') {
+        ++dir_path;
+        --dir_len;
+      }
+
+      if (dir_path[dir_len - 1] == '"' || dir_path[dir_len - 1] == '\'') {
+        --dir_len;
+      }
+
+      result = path_search_walk_ext(dir_path, dir_len,
                                     file, file_len,
                                     cwd, cwd_len,
                                     name_has_ext);
@@ -386,7 +400,7 @@ wchar_t* quote_cmd_arg(const wchar_t *source, wchar_t *target) {
   }
 
   /*
-   * Expected intput/output:
+   * Expected input/output:
    *   input : hello"world
    *   output: "hello\"world"
    *   input : hello""world
@@ -531,12 +545,12 @@ wchar_t* make_program_env(char** env_block) {
 
   for (env = env_block; *env; env++) {
     check_required_vars_contains_var(required_vars,
-                                     COUNTOF(required_vars),
+                                     ARRAY_SIZE(required_vars),
                                      *env);
     env_len += (uv_utf8_to_utf16(*env, NULL, 0) * sizeof(wchar_t));
   }
 
-  for (i = 0; i < COUNTOF(required_vars); ++i) {
+  for (i = 0; i < ARRAY_SIZE(required_vars); ++i) {
     if (!required_vars[i].supplied) {
       env_len += required_vars[i].len * sizeof(wchar_t);
       var_size = GetEnvironmentVariableW(required_vars[i].wide, NULL, 0);
@@ -563,7 +577,7 @@ wchar_t* make_program_env(char** env_block) {
     }
   }
 
-  for (i = 0; i < COUNTOF(required_vars); ++i) {
+  for (i = 0; i < ARRAY_SIZE(required_vars); ++i) {
     if (!required_vars[i].supplied) {
       wcscpy(ptr, required_vars[i].wide);
       ptr += required_vars[i].len - 1;
@@ -661,7 +675,7 @@ static void close_child_stdio(uv_process_t* process) {
   int i;
   HANDLE handle;
 
-  for (i = 0; i < COUNTOF(process->child_stdio); i++) {
+  for (i = 0; i < ARRAY_SIZE(process->child_stdio); i++) {
     handle = process->child_stdio[i];
     if (handle != NULL && handle != INVALID_HANDLE_VALUE) {
       CloseHandle(handle);
@@ -1004,7 +1018,7 @@ int uv_spawn(uv_loop_t* loop, uv_process_t* process,
 
   } else {
     /* CreateProcessW failed, but this failure should be delivered */
-    /* asynchronously to retain unix compatibility. So pretent spawn */
+    /* asynchronously to retain unix compatibility. So pretend spawn */
     /* succeeded, and start a thread instead that prints an error */
     /* to the child's intended stderr. */
     process->spawn_errno = GetLastError();
@@ -1032,9 +1046,9 @@ done:
     close_child_stdio(process);
   } else {
     /* We're keeping the handles open, the thread pool is going to have */
-    /* it's way with them. But at least make them noninheritable. */
+    /* it's way with them. But at least make them non-inheritable. */
     int i;
-    for (i = 0; i < COUNTOF(process->child_stdio); i++) {
+    for (i = 0; i < ARRAY_SIZE(process->child_stdio); i++) {
       SetHandleInformation(child_stdio[i], HANDLE_FLAG_INHERIT, 0);
     }
   }
@@ -1059,7 +1073,7 @@ static uv_err_t uv__kill(HANDLE process_handle, int signum) {
   DWORD status;
   uv_err_t err;
 
-  if (signum == SIGTERM || signum == SIGKILL) {
+  if (signum == SIGTERM || signum == SIGKILL || signum == SIGINT) {
     /* Kill the process. On Windows, killed processes normally return 1. */
     if (TerminateProcess(process_handle, 1)) {
       err = uv_ok_;
@@ -1068,14 +1082,17 @@ static uv_err_t uv__kill(HANDLE process_handle, int signum) {
     }
   } else if (signum == 0) {
     /* Health check: is the process still alive? */
-    if (GetExitCodeProcess(process_handle, &status) &&
-        status == STILL_ACTIVE) {
-      err =  uv_ok_;
+    if (GetExitCodeProcess(process_handle, &status)) {
+      if (status == STILL_ACTIVE) {
+        err =  uv_ok_;
+      } else {
+        err = uv__new_artificial_error(UV_ESRCH);
+      }
     } else {
       err = uv__new_sys_error(GetLastError());
     }
   } else {
-    err.code = UV_ENOSYS;
+    err = uv__new_artificial_error(UV_ENOSYS);
   }
 
   return err;
@@ -1108,8 +1125,12 @@ uv_err_t uv_kill(int pid, int signum) {
   HANDLE process_handle = OpenProcess(PROCESS_TERMINATE |
     PROCESS_QUERY_INFORMATION, FALSE, pid);
 
-  if (process_handle == INVALID_HANDLE_VALUE) {
-    return uv__new_sys_error(GetLastError());
+  if (process_handle == NULL) {
+    if (GetLastError() == ERROR_INVALID_PARAMETER) {
+      return uv__new_artificial_error(UV_ESRCH);
+    } else {
+      return uv__new_sys_error(GetLastError());
+    }
   }
 
   err = uv__kill(process_handle, signum);

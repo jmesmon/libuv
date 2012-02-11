@@ -68,11 +68,13 @@ static void kill_cb(uv_process_t* process, int exit_status, int term_signal) {
   ASSERT(no_term_signal || term_signal == 15);
   uv_close((uv_handle_t*)process, close_cb);
 
-  /* Sending signum == 0 should check if the
+  /*
+   * Sending signum == 0 should check if the
    * child process is still alive, not kill it.
+   * This process should be dead.
    */
   err = uv_kill(process->pid, 0);
-  ASSERT(err.code != UV_OK);
+  ASSERT(err.code == UV_ESRCH);
 }
 
 
@@ -209,6 +211,37 @@ TEST_IMPL(spawn_and_kill) {
   int r;
 
   init_process_options("spawn_helper4", kill_cb);
+
+  r = uv_spawn(uv_default_loop(), &process, options);
+  ASSERT(r == 0);
+
+  r = uv_timer_init(uv_default_loop(), &timer);
+  ASSERT(r == 0);
+
+  r = uv_timer_start(&timer, timer_cb, 500, 0);
+  ASSERT(r == 0);
+
+  r = uv_run(uv_default_loop());
+  ASSERT(r == 0);
+
+  ASSERT(exit_cb_called == 1);
+  ASSERT(close_cb_called == 2); /* Once for process and once for timer. */
+
+  return 0;
+}
+
+
+TEST_IMPL(spawn_and_kill_with_std) {
+  int r;
+  uv_pipe_t out;
+  uv_pipe_t in;
+
+  init_process_options("spawn_helper4", kill_cb);
+
+  uv_pipe_init(uv_default_loop(), &out, 0);
+  uv_pipe_init(uv_default_loop(), &in, 0);
+  options.stdout_stream = &out;
+  options.stdin_stream = &in;
 
   r = uv_spawn(uv_default_loop(), &process, options);
   ASSERT(r == 0);

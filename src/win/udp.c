@@ -34,10 +34,6 @@ const unsigned int uv_active_udp_streams_threshold = 0;
 /* A zero-size buffer for use by uv_udp_read */
 static char uv_zero_[] = "";
 
-/* Counter to keep track of active udp streams */
-static unsigned int active_udp_streams = 0;
-
-
 int uv_udp_getsockname(uv_udp_t* handle, struct sockaddr* name,
     int* namelen) {
   uv_loop_t* loop = handle->loop;
@@ -166,9 +162,9 @@ static int uv__bind(uv_udp_t* handle,
                     struct sockaddr* addr,
                     int addrsize,
                     unsigned int flags) {
-  DWORD err;
   int r;
   SOCKET sock;
+  DWORD no = 0, yes = 1;
 
   if ((flags & UV_UDP_IPV6ONLY) && domain != AF_INET6) {
     /* UV_UDP_IPV6ONLY is supported only for IPV6 sockets */
@@ -190,7 +186,6 @@ static int uv__bind(uv_udp_t* handle,
   }
 
   if (domain == AF_INET6 && !(flags & UV_UDP_IPV6ONLY)) {
-    DWORD off = 0;
     /* On windows IPV6ONLY is on by default. */
     /* If the user doesn't specify it libuv turns it off. */
 
@@ -200,14 +195,22 @@ static int uv__bind(uv_udp_t* handle,
     setsockopt(sock,
                IPPROTO_IPV6,
                IPV6_V6ONLY,
-               (const char*) &off,
-               sizeof off);
+               (char*) &no,
+               sizeof no);
+  }
+
+  r = setsockopt(sock,
+                 SOL_SOCKET,
+                 SO_REUSEADDR,
+                 (char*) &yes,
+                 sizeof yes);
+  if (r == SOCKET_ERROR) {
+    uv__set_sys_error(handle->loop, WSAGetLastError());
+    return -1;
   }
 
   r = bind(handle->socket, addr, addrsize);
-
   if (r == SOCKET_ERROR) {
-    err = WSAGetLastError();
     uv__set_sys_error(handle->loop, WSAGetLastError());
     return -1;
   }
@@ -244,15 +247,6 @@ int uv__udp_bind6(uv_udp_t* handle, struct sockaddr_in6 addr,
 }
 
 
-int uv_udp_set_membership(uv_udp_t* handle, const char* multicast_addr,
-  const char* interface_addr, uv_membership membership) {
-
-  /* not implemented yet */
-  uv__set_artificial_error(handle->loop, UV_ENOSYS);
-  return -1;
-}
-
-
 static void uv_udp_queue_recv(uv_loop_t* loop, uv_udp_t* handle) {
   uv_req_t* req;
   uv_buf_t buf;
@@ -269,7 +263,7 @@ static void uv_udp_queue_recv(uv_loop_t* loop, uv_udp_t* handle) {
    * Preallocate a read buffer if the number of active streams is below
    * the threshold.
   */
-  if (active_udp_streams < uv_active_udp_streams_threshold) {
+  if (loop->active_udp_streams < uv_active_udp_streams_threshold) {
     handle->flags &= ~UV_HANDLE_ZERO_READ;
 
     handle->recv_buffer = handle->alloc_cb((uv_handle_t*) handle, 65536);
@@ -357,12 +351,12 @@ int uv_udp_recv_start(uv_udp_t* handle, uv_alloc_cb alloc_cb,
   }
 
   handle->flags |= UV_HANDLE_READING;
-  active_udp_streams++;
+  loop->active_udp_streams++;
 
   handle->recv_cb = recv_cb;
   handle->alloc_cb = alloc_cb;
 
-  /* If reading was stopped and then started again, there could stell be a */
+  /* If reading was stopped and then started again, there could still be a */
   /* recv request pending. */
   if (!(handle->flags & UV_HANDLE_READ_PENDING))
     uv_udp_queue_recv(loop, handle);
@@ -374,7 +368,7 @@ int uv_udp_recv_start(uv_udp_t* handle, uv_alloc_cb alloc_cb,
 int uv_udp_recv_stop(uv_udp_t* handle) {
   if (handle->flags & UV_HANDLE_READING) {
     handle->flags &= ~UV_HANDLE_READING;
-    active_udp_streams--;
+    handle->loop->active_udp_streams--;
   }
 
   return 0;
@@ -466,17 +460,31 @@ void uv_process_udp_recv_req(uv_loop_t* loop, uv_udp_t* handle,
 
   handle->flags &= ~UV_HANDLE_READ_PENDING;
 
-  if (!REQ_SUCCESS(req) &&
-      GET_REQ_SOCK_ERROR(req) != WSAEMSGSIZE) {
-    /* An error occurred doing the read. */
-    if (handle->flags & UV_HANDLE_READING) {
-      uv__set_sys_error(loop, GET_REQ_SOCK_ERROR(req));
-      uv_udp_recv_stop(handle);
-      buf = (handle->flags & UV_HANDLE_ZERO_READ) ?
-            uv_buf_init(NULL, 0) : handle->recv_buffer;
-      handle->recv_cb(handle, -1, buf, NULL, 0);
+  if (!REQ_SUCCESS(req)) {
+    DWORD err = GET_REQ_SOCK_ERROR(req);
+    if (err == WSAEMSGSIZE) {
+      /* Not a real error, it just indicates that the received packet */
+      /* was bigger than the receive buffer. */
+    } else if (err == WSAECONNRESET || err == WSAENETRESET) {
+      /* A previous sendto operation failed; ignore this error. If */
+      /* zero-reading we need to call WSARecv/WSARecvFrom _without_ the */
+      /* MSG_PEEK flag to clear out the error queue. For nonzero reads, */
+      /* immediately queue a new receive. */
+      if (!(handle->flags & UV_HANDLE_ZERO_READ)) {
+        goto done;
+      }
+    } else {
+      /* A real error occurred. Report the error to the user only if we're */
+      /* currently reading. */
+      if (handle->flags & UV_HANDLE_READING) {
+        uv__set_sys_error(loop, err);
+        uv_udp_recv_stop(handle);
+        buf = (handle->flags & UV_HANDLE_ZERO_READ) ?
+              uv_buf_init(NULL, 0) : handle->recv_buffer;
+        handle->recv_cb(handle, -1, buf, NULL, 0);
+      }
+      goto done;
     }
-    goto done;
   }
 
   if (!(handle->flags & UV_HANDLE_ZERO_READ)) {
@@ -527,8 +535,10 @@ void uv_process_udp_recv_req(uv_loop_t* loop, uv_udp_t* handle,
         /* Kernel buffer empty */
         uv__set_sys_error(loop, WSAEWOULDBLOCK);
         handle->recv_cb(handle, 0, buf, NULL, 0);
-      } else {
-        /* Ouch! serious error. */
+      } else if (err != WSAECONNRESET && err != WSAENETRESET) {
+        /* Serious error. WSAECONNRESET/WSANETRESET is ignored because this */
+        /* just indicates that a previous sendto operation failed. */
+        uv_udp_recv_stop(handle);
         uv__set_sys_error(loop, err);
         handle->recv_cb(handle, -1, buf, NULL, 0);
       }
@@ -562,3 +572,115 @@ void uv_process_udp_send_req(uv_loop_t* loop, uv_udp_t* handle,
   DECREASE_PENDING_REQ_COUNT(handle);
 }
 
+
+int uv_udp_set_membership(uv_udp_t* handle, const char* multicast_addr,
+    const char* interface_addr, uv_membership membership) {
+  int optname;
+  struct ip_mreq mreq;
+
+  /* If the socket is unbound, bind to inaddr_any. */
+  if (!(handle->flags & UV_HANDLE_BOUND) &&
+      uv_udp_bind(handle, uv_addr_ip4_any_, 0) < 0) {
+    return -1;
+  }
+
+  if (handle->flags & UV_HANDLE_IPV6) {
+    uv__set_artificial_error(handle->loop, UV_ENOSYS);
+    return -1;
+  }
+
+  memset(&mreq, 0, sizeof mreq);
+
+  if (interface_addr) {
+    mreq.imr_interface.s_addr = inet_addr(interface_addr);
+  } else {
+    mreq.imr_interface.s_addr = htonl(INADDR_ANY);
+  }
+
+  mreq.imr_multiaddr.s_addr = inet_addr(multicast_addr);
+
+  switch (membership) {
+    case UV_JOIN_GROUP:
+      optname = IP_ADD_MEMBERSHIP;
+      break;
+    case UV_LEAVE_GROUP:
+      optname = IP_DROP_MEMBERSHIP;
+      break;
+    default:
+      uv__set_artificial_error(handle->loop, UV_EFAULT);
+      return -1;
+  }
+
+  if (setsockopt(handle->socket,
+                 IPPROTO_IP,
+                 optname,
+                 (char*) &mreq,
+                 sizeof mreq) == SOCKET_ERROR) {
+      uv__set_sys_error(handle->loop, WSAGetLastError());
+    return -1;
+  }
+
+  return 0;
+}
+
+
+int uv_udp_set_broadcast(uv_udp_t* handle, int value) {
+  BOOL optval = (BOOL) value;
+
+  /* If the socket is unbound, bind to inaddr_any. */
+  if (!(handle->flags & UV_HANDLE_BOUND) &&
+      uv_udp_bind(handle, uv_addr_ip4_any_, 0) < 0) {
+    return -1;
+  }
+
+  if (setsockopt(handle->socket,
+                  SOL_SOCKET,
+                  SO_BROADCAST,
+                  (char*) &optval,
+                  sizeof optval)) {
+    uv__set_sys_error(handle->loop, WSAGetLastError());
+    return -1;
+  }
+  return 0;
+}
+
+
+#define SOCKOPT_SETTER(name, option4, option6)                                \
+  int uv_udp_set_##name(uv_udp_t* handle, int value) {                        \
+    DWORD optval = (DWORD) value;                                             \
+                                                                              \
+    /* If the socket is unbound, bind to inaddr_any. */                       \
+    if (!(handle->flags & UV_HANDLE_BOUND) &&                                 \
+        uv_udp_bind(handle, uv_addr_ip4_any_, 0) < 0) {                       \
+      return -1;                                                              \
+    }                                                                         \
+                                                                              \
+    if (!(handle->flags & UV_HANDLE_IPV6)) {                                  \
+      /* Set IPv4 socket option */                                            \
+      if (setsockopt(handle->socket,                                          \
+                     IPPROTO_IP,                                              \
+                     option4,                                                 \
+                     (char*) &optval,                                         \
+                     sizeof optval)) {                                        \
+        uv__set_sys_error(handle->loop, WSAGetLastError());                   \
+        return -1;                                                            \
+      }                                                                       \
+    } else {                                                                  \
+      /* Set IPv6 socket option */                                            \
+      if (setsockopt(handle->socket,                                          \
+                     IPPROTO_IPV6,                                            \
+                     option6,                                                 \
+                     (char*) &optval,                                         \
+                     sizeof optval)) {                                        \
+        uv__set_sys_error(handle->loop, WSAGetLastError());                   \
+        return -1;                                                            \
+      }                                                                       \
+    }                                                                         \
+    return 0;                                                                 \
+  }
+
+SOCKOPT_SETTER(multicast_loop, IP_MULTICAST_LOOP, IPV6_MULTICAST_LOOP)
+SOCKOPT_SETTER(multicast_ttl, IP_MULTICAST_TTL, IPV6_MULTICAST_HOPS)
+SOCKOPT_SETTER(ttl, IP_TTL, IPV6_HOPLIMIT)
+
+#undef SOCKOPT_SETTER
